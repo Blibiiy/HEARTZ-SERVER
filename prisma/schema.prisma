@@ -1,0 +1,127 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id              String            @id @default(cuid())
+  name            String
+  email           String            @unique
+  passwordHash    String
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  audioFiles      AudioFile[]
+  authSessions    AuthSession[]
+  sessions        PracticeSession[]
+  weeklySummaries WeeklySummary[]
+
+  @@map("users")
+}
+
+model Syllable {
+  id                     String            @id @default(cuid())
+  code                   String            @unique
+  label                  String?
+  createdAt              DateTime          @default(now())
+  targetSessions         PracticeSession[] @relation("TargetSyllable")
+  predictedIn            Prediction[]      @relation("PredictedSyllable")
+  weeklyMostPracticed    WeeklySummary[]   @relation("WeeklyMostPracticed")
+  weeklyNeedsImprovement WeeklySummary[]   @relation("WeeklyNeedsImprovement")
+
+  @@map("syllables")
+}
+
+model AudioFile {
+  id            String            @id @default(cuid())
+  userId        String
+  s3Bucket      String
+  s3Key         String
+  s3Region      String?
+  contentType   String?
+  sizeBytes     Int?
+  sampleRate    Int?
+  channels      Int?
+  bitsPerSample Int?
+  durationMs    Int?
+  createdAt     DateTime          @default(now())
+  user          User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessions      PracticeSession[]
+  predictions   Prediction[]
+
+  @@unique([s3Bucket, s3Key])
+  @@index([userId, createdAt])
+  @@map("audio_files")
+}
+
+model PracticeSession {
+  id               String      @id @default(cuid())
+  userId           String
+  createdAt        DateTime    @default(now())
+  isCorrect        Boolean
+  score            Float
+  audioFileId      String?
+  targetSyllableId String
+  audioFile        AudioFile?  @relation(fields: [audioFileId], references: [id])
+  targetSyllable   Syllable    @relation("TargetSyllable", fields: [targetSyllableId], references: [id])
+  user             User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  prediction       Prediction?
+
+  @@index([userId, createdAt])
+  @@index([targetSyllableId, createdAt])
+  @@map("practice_sessions")
+}
+
+model Prediction {
+  id                  String          @id @default(cuid())
+  practiceSessionId   String          @unique
+  audioFileId         String?
+  predictedSyllableId String
+  affirmation         String?
+  createdAt           DateTime        @default(now())
+  audioFile           AudioFile?      @relation(fields: [audioFileId], references: [id])
+  practiceSession     PracticeSession @relation(fields: [practiceSessionId], references: [id], onDelete: Cascade)
+  predictedSyllable   Syllable        @relation("PredictedSyllable", fields: [predictedSyllableId], references: [id])
+
+  @@index([predictedSyllableId, createdAt])
+  @@map("predictions")
+}
+
+model AuthSession {
+  id               String    @id @default(cuid())
+  userId           String
+  refreshTokenHash String
+  createdAt        DateTime  @default(now())
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  ip               String?
+  userAgent        String?
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, expiresAt])
+  @@map("auth_sessions")
+}
+
+model WeeklySummary {
+  id                 String    @id @default(cuid())
+  userId             String
+  weekStart          DateTime
+  totalPracticeCount Int
+  overallAccuracy    Float
+  mostPracticedId    String?
+  needsImprovementId String?
+  geminiWeeklyReport String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  mostPracticed      Syllable? @relation("WeeklyMostPracticed", fields: [mostPracticedId], references: [id])
+  needsImprovement   Syllable? @relation("WeeklyNeedsImprovement", fields: [needsImprovementId], references: [id])
+  user               User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, weekStart])
+  @@index([weekStart])
+  @@map("weekly_summaries")
+}

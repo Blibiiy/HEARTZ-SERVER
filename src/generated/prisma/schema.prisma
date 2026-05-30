@@ -1,0 +1,158 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id           String @id @default(cuid())
+  name         String
+  email        String @unique
+  passwordHash String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions        PracticeSession[]
+  audioFiles      AudioFile[]
+  authSessions    AuthSession[]
+  weeklySummaries WeeklySummary[]
+
+  @@map("users")
+}
+
+model Syllable {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  label     String?
+  createdAt DateTime @default(now())
+
+  targetSessions PracticeSession[] @relation("TargetSyllable")
+  predictedIn    Prediction[]      @relation("PredictedSyllable")
+
+  weeklyMostPracticed    WeeklySummary[] @relation("WeeklyMostPracticed")
+  weeklyNeedsImprovement WeeklySummary[] @relation("WeeklyNeedsImprovement")
+
+  @@map("syllables")
+}
+
+model AudioFile {
+  id     String @id @default(cuid())
+  userId String
+
+  s3Bucket String
+  s3Key    String
+  s3Region String?
+
+  contentType String?
+  sizeBytes   Int?
+
+  sampleRate    Int?
+  channels      Int?
+  bitsPerSample Int?
+  durationMs    Int?
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  sessions    PracticeSession[]
+  predictions Prediction[]
+
+  @@unique([s3Bucket, s3Key])
+  @@index([userId, createdAt])
+  @@map("audio_files")
+}
+
+model PracticeSession {
+  id     String @id @default(cuid())
+  userId String
+
+  createdAt DateTime @default(now())
+
+  targetSyllableId String
+  targetSyllable   Syllable @relation("TargetSyllable", fields: [targetSyllableId], references: [id])
+
+  audioFileId String?
+  audioFile   AudioFile? @relation(fields: [audioFileId], references: [id], onDelete: SetNull)
+
+  isCorrect Boolean
+  score     Float
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  prediction Prediction?
+
+  @@index([userId, createdAt])
+  @@index([targetSyllableId, createdAt])
+  @@map("practice_sessions")
+}
+
+model Prediction {
+  id String @id @default(cuid())
+
+  practiceSessionId String          @unique
+  practiceSession   PracticeSession @relation(fields: [practiceSessionId], references: [id], onDelete: Cascade)
+
+  audioFileId String?
+  audioFile   AudioFile? @relation(fields: [audioFileId], references: [id], onDelete: SetNull)
+
+  predictedSyllableId String
+  predictedSyllable   Syllable @relation("PredictedSyllable", fields: [predictedSyllableId], references: [id])
+
+  affirmation String?
+
+  createdAt DateTime @default(now())
+
+  @@index([predictedSyllableId, createdAt])
+  @@map("predictions")
+}
+
+model AuthSession {
+  id     String @id @default(cuid())
+  userId String
+
+  refreshTokenHash String
+
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  ip        String?
+  userAgent String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, expiresAt])
+  @@map("auth_sessions")
+}
+
+model WeeklySummary {
+  id     String @id @default(cuid())
+  userId String
+
+  weekStart DateTime
+
+  totalPracticeCount Int
+  overallAccuracy    Float
+
+  mostPracticedId String?
+  mostPracticed   Syllable? @relation("WeeklyMostPracticed", fields: [mostPracticedId], references: [id])
+
+  needsImprovementId String?
+  needsImprovement   Syllable? @relation("WeeklyNeedsImprovement", fields: [needsImprovementId], references: [id])
+
+  geminiWeeklyReport String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, weekStart])
+  @@index([weekStart])
+  @@map("weekly_summaries")
+}
