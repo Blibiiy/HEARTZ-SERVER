@@ -5,11 +5,25 @@ import { uploadAudioToS3 } from '../services/s3Service.js';
 import catchAsync from '../utils/catchAsync.js';
 import AppError from '../utils/AppError.js';
 
+export const warmupPredictServer = catchAsync(async (req, res, next) => {
+  const mlTargetUrl = `${process.env.ML_API_URL}/predict`;
+  
+  axios.get(mlTargetUrl)
+    .catch((err) => {
+      console.error('[Warmup] Gagal memicu pemanasan API AI:', err.message);
+    });
+
+  return res.status(200).json({
+    status: 'success',
+    statusCode: 200,
+    message: 'Proses pemanasan server AI berhasil dipicu di latar belakang.',
+  });
+});
+
 export const predictSyllable = catchAsync(async (req, res, next) => {
   const { targetSyllableId } = req.body;
-  const userId = req.user?.userId; // Diambil dari payload token JWT yang valid
+  const userId = req.user?.userId;
 
-  // 1. Validasi Input Awal
   if (!targetSyllableId) {
     return next(
       new AppError('Parameter targetSyllableId wajib disertakan pada request body.', 400, {
@@ -18,7 +32,6 @@ export const predictSyllable = catchAsync(async (req, res, next) => {
     );
   }
 
-  // 2. Pastikan Target Suku Kata Eksis di Database (Menggunakan prisma.syllable)
   const targetSyllable = await prisma.syllable.findUnique({
     where: { id: targetSyllableId },
   });
@@ -31,10 +44,8 @@ export const predictSyllable = catchAsync(async (req, res, next) => {
     );
   }
 
-  // 3. Unggah Berkas Audio Asli ke Amazon S3 Bucket
   const s3Result = await uploadAudioToS3(req.file.buffer, req.file.mimetype, userId);
 
-  // 4. Kirim Berkas Biner ke Flask ML API via Axios + FormData
   const form = new FormData();
   form.append('audio', req.file.buffer, {
     filename: req.file.originalname || 'audio.wav',
@@ -47,7 +58,7 @@ export const predictSyllable = catchAsync(async (req, res, next) => {
     
     const response = await axios.post(mlTargetUrl, form, {
       headers: { ...form.getHeaders() },
-      timeout: 10000, // Batas toleransi tunggu respons 10 detik
+      timeout: 10000,
     });
     
     mlResponse = response.data;
@@ -60,21 +71,16 @@ export const predictSyllable = catchAsync(async (req, res, next) => {
     );
   }
 
-  // Ekstraksi data murni dari format respons riyal model tim ML
   const { confidence, prediction, motivation_message } = mlResponse;
 
-  // 5. Logika Bisnis: Cari ID dari Suku Kata Hasil Prediksi (Menggunakan prisma.syllable)
   const predictedSyllableRecord = await prisma.syllable.findUnique({
     where: { code: prediction.toLowerCase() },
   });
 
-  // 6. Evaluasi Hasil: Bandingkan Kode Suku Kata Target vs Hasil Prediksi Model
   const isCorrect = targetSyllable.code.toLowerCase() === prediction.toLowerCase();
 
-  // 7. Operasi Transaksional ACID Database (Menggunakan nama model runtime singular camelCase)
   const resultData = await prisma.$transaction(async (tx) => {
     
-    // A. Simpan metadata berkas audio ke model tx.audioFile
     const audioFile = await tx.audioFile.create({
       data: {
         userId,
@@ -87,7 +93,6 @@ export const predictSyllable = catchAsync(async (req, res, next) => {
       },
     });
 
-    // B. Simpan data sesi latihan ke model tx.practiceSession
     const practiceSession = await tx.practiceSession.create({
       data: {
         userId,
@@ -98,12 +103,10 @@ export const predictSyllable = catchAsync(async (req, res, next) => {
       },
     });
 
-    // C. Simpan data hasil prediksi AI ke model tx.prediction
     const predictionRecord = await tx.prediction.create({
       data: {
         practiceSessionId: practiceSession.id,
         audioFileId: audioFile.id,
-        // Jika kode prediksi tidak terdaftar di data master, kolom diset null agar tidak melanggar foreign key constraint
         predictedSyllableId: predictedSyllableRecord ? predictedSyllableRecord.id : null,
         affirmation: motivation_message || 'Terus berlatih untuk hasil yang lebih maksimal!',
       },
@@ -116,7 +119,6 @@ export const predictSyllable = catchAsync(async (req, res, next) => {
     };
   });
 
-  // 8. Kembalikan Respons Akhir yang Bersih dan Akurat ke Front-End
   return res.status(200).json({
     status: 'success',
     statusCode: 200,
