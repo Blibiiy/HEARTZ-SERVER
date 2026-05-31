@@ -5,28 +5,31 @@ import { GoogleGenAI } from '@google/genai';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-const generateWeeklyReport = async (stats) => {
+const generateWeeklyReport = async (stats, rangeLabel) => {
   try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: `
-        Berikut adalah statistik latihan bicara pasien dalam 7 hari terakhir:
-        - Total Sesi Latihan: ${stats.totalPracticeCount} kali
-        - Pelafalan Benar (Sukses): ${stats.totalCorrect} kali
-        - Pelafalan Salah: ${stats.totalIncorrect} kali
-        - Rata-rata Skor Akurasi Sistem: ${(stats.overallAccuracy * 100).toFixed(1)}%
+    const model = 'gemini-2.5-flash';
+    const systemInstruction = 'Anda adalah seorang Ahli Terapi Bicara (Speech Therapist) profesional yang ramah, empatik, dan suportif. Tugas Anda adalah memberikan evaluasi klinis singkat sepanjang 2 hingga 3 kalimat berdasarkan data statistik latihan pasien yang diberikan. Berikan motivasi yang membangun dan sebutkan poin performa mereka secara ringkas. JANGAN gunakan format markdown seperti tanda bintang (**) atau bullet-points. Kembalikan teks narasi murni.';
 
-        Berikan ringkasan evaluasi perkembangan mingguan untuk pasien ini sesuai instruksi sistem!
-      `,
-      config: {
-        systemInstruction: 'Anda adalah seorang Ahli Terapi Bicara (Speech Therapist) profesional yang ramah, empatik, dan suportif. Tugas Anda adalah memberikan evaluasi klinis singkat sepanjang 2 hingga 3 kalimat berdasarkan data statistik latihan pasien yang diberikan. Berikan motivasi yang membangun dan sebutkan poin performa mereka secara ringkas. JANGAN gunakan format markdown seperti tanda bintang (**) atau bullet-points. Kembalikan teks narasi murni.'
-      }
+    const prompt = `
+      Berikut adalah statistik latihan bicara pasien dalam rentang waktu ${rangeLabel}:
+      - Total Sesi Latihan: ${stats.totalPracticeCount} kali
+      - Pelafalan Benar (Sukses): ${stats.totalCorrect} kali
+      - Pelafalan Salah: ${stats.totalIncorrect} kali
+      - Rata-rata Skor Akurasi Sistem: ${(stats.overallAccuracy * 100).toFixed(1)}%
+
+      Berikan ringkasan evaluasi perkembangan untuk pasien ini sesuai instruksi sistem!
+    `;
+
+    const response = await ai.models.generateContent({
+      model,
+      contents: prompt,
+      config: { systemInstruction }
     });
 
-    return response.text.trim(); 
+    return response.text.trim();
   } catch (error) {
     console.error('Error pada Gemini Service:', error);
-    return `Selamat atas dedikasi Anda dalam menyelesaikan ${stats.totalPracticeCount} sesi latihan selama 7 hari terakhir dengan tingkat akurasi ${(stats.overallAccuracy * 100).toFixed(1)}%. Teruskan latihan Anda secara konsisten untuk mencapai hasil yang optimal!`;
+    return `Selamat atas dedikasi Anda dalam menyelesaikan ${stats.totalPracticeCount} sesi latihan selama rentang waktu ${rangeLabel} dengan tingkat akurasi ${(stats.overallAccuracy * 100).toFixed(1)}%. Teruskan latihan Anda secara konsisten untuk mencapai hasil yang optimal!`;
   }
 };
 
@@ -116,10 +119,28 @@ export const getHistoryBySessionId = catchAsync(async (req, res, next) => {
 
 export const getHistorySummary = catchAsync(async (req, res, next) => {
   const userId = req.user.userId;
+  const { range } = req.query;
 
   const endDate = new Date();
-  const startDate = new Date();
-  startDate.setDate(endDate.getDate() - 7);
+  let startDate;
+  let rangeLabel = '7 hari terakhir';
+  let cacheKeyDate;
+
+  if (range === '30d') {
+    startDate = new Date();
+    startDate.setDate(endDate.getDate() - 30);
+    rangeLabel = '30 hari terakhir';
+    cacheKeyDate = startDate;
+  } else if (range === 'all') {
+    startDate = new Date(0); 
+    rangeLabel = 'seluruh waktu latihan (All-Time)';
+    cacheKeyDate = new Date('1970-01-01T00:00:00.000Z');
+  } else {
+    startDate = new Date();
+    startDate.setDate(endDate.getDate() - 7);
+    rangeLabel = '7 hari terakhir';
+    cacheKeyDate = startDate;
+  }
 
   const historyData = await prisma.practiceSession.findMany({
     where: {
@@ -139,7 +160,7 @@ export const getHistorySummary = catchAsync(async (req, res, next) => {
       statusCode: 200,
       data: {
         timeRange: {
-          startDate: startDate.toISOString(),
+          startDate: range === 'all' ? 'ALL_TIME' : startDate.toISOString(),
           endDate: endDate.toISOString(),
         },
         stats: {
@@ -148,7 +169,7 @@ export const getHistorySummary = catchAsync(async (req, res, next) => {
           totalIncorrect: 0,
           overallAccuracy: 0.0,
         },
-        geminiWeeklyReport: 'Anda belum melakukan sesi latihan dalam 7 hari terakhir. Silakan lakukan latihan pelafalan pertama Anda untuk melihat perkembangan AI di sini!',
+        geminiWeeklyReport: `Anda belum memiliki catatan sesi latihan dalam rentang ${rangeLabel}. Silakan lakukan latihan pelafalan terlebih dahulu untuk melihat perkembangan AI di sini!`,
       },
     });
   }
@@ -176,7 +197,10 @@ export const getHistorySummary = catchAsync(async (req, res, next) => {
   };
 
   const existingSummary = await prisma.weeklySummary.findFirst({
-    where: { userId },
+    where: { 
+      userId,
+      weekStart: range === 'all' ? cacheKeyDate : { gte: cacheKeyDate }
+    },
   });
 
   let reportText = '';
@@ -185,12 +209,12 @@ export const getHistorySummary = catchAsync(async (req, res, next) => {
     if (existingSummary.totalPracticeCount === totalPracticeCount) {
       reportText = existingSummary.geminiWeeklyReport;
     } else {
-      reportText = await generateWeeklyReport(currentStats);
+      reportText = await generateWeeklyReport(currentStats, rangeLabel);
 
       await prisma.weeklySummary.update({
         where: { id: existingSummary.id },
         data: {
-          weekStart: startDate,
+          weekStart: cacheKeyDate,
           totalPracticeCount,
           overallAccuracy,
           geminiWeeklyReport: reportText,
@@ -198,12 +222,12 @@ export const getHistorySummary = catchAsync(async (req, res, next) => {
       });
     }
   } else {
-    reportText = await generateWeeklyReport(currentStats);
+    reportText = await generateWeeklyReport(currentStats, rangeLabel);
 
     await prisma.weeklySummary.create({
       data: {
         userId,
-        weekStart: startDate,
+        weekStart: cacheKeyDate,
         totalPracticeCount,
         overallAccuracy,
         geminiWeeklyReport: reportText,
@@ -216,7 +240,7 @@ export const getHistorySummary = catchAsync(async (req, res, next) => {
     statusCode: 200,
     data: {
       timeRange: {
-        startDate: startDate.toISOString(),
+        startDate: range === 'all' ? 'ALL_TIME' : startDate.toISOString(),
         endDate: endDate.toISOString(),
       },
       stats: currentStats,
