@@ -134,3 +134,23 @@ export const predictSyllable = catchAsync(async (req, res, next) => {
     },
   });
 });
+
+
+export const getAllSyllables = catchAsync(async (req, res, next) => {
+  const syllables = await prisma.syllable.findMany({
+    select: {
+      id: true,
+      code: true,
+    },
+    orderBy: {
+      code: 'asc',
+    },
+  });
+
+  return res.status(200).json({
+    status: 'success',
+    statusCode: 200,
+    results: syllables.length,
+    data: syllables,
+  });
+});
