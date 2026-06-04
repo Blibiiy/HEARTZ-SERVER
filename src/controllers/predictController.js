@@ -5,6 +5,62 @@ import { uploadAudioToS3 } from '../services/s3Service.js';
 import catchAsync from '../utils/catchAsync.js';
 import AppError from '../utils/AppError.js';
 
+const capitalizeTarget = (str) => {
+  if (!str) return '';
+  return str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
+};
+
+const predictModelRendiWithRetry = async (buffer, originalname, mimetype, target_label, maxRetries = 5) => {
+  const mlTargetUrl = `${process.env.ML_API_URL}/predict`;
+  const formattedTarget = target_label.toLowerCase(); // 🌟 Paksa huruf kecil untuk Rendi
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const form = new FormData();
+      form.append('audio', buffer, {
+        filename: originalname || 'audio.wav',
+        contentType: mimetype,
+      });
+      form.append('target_label', formattedTarget);
+
+      const response = await axios.post(mlTargetUrl, form, {
+        headers: { ...form.getHeaders() },
+        timeout: 15000,
+      });
+      
+      return { status: 'success', data: response.data };
+    } catch (error) {
+      console.warn(`[Model Rendi] Percobaan ${attempt} gagal:`, error.message);
+      if (attempt === maxRetries) {
+        return { status: 'error', message: error.message };
+      }
+    }
+  }
+};
+
+const predictModelGhildan = async (buffer, target_label) => {
+  const formattedTarget = capitalizeTarget(target_label); // 🌟 Paksa huruf besar di awal untuk Ghildan
+  const targetUrl = `https://30gz15d4bh.execute-api.ap-southeast-2.amazonaws.com/prod/predict?target=${formattedTarget}`;
+  
+  try {
+    const response = await axios.post(targetUrl, buffer, {
+      headers: {
+        'Content-Type': 'audio/wav',
+      },
+      timeout: 15000,
+    });
+    
+    return { status: 'success', data: response.data };
+  } catch (error) {
+    console.error('[Model Ghildan] Gagal mendapatkan respons:', error.message);
+    return { 
+      status: 'error', 
+      message: error.message,
+      aws_error_detail: error.response?.data || 'Tidak ada detail data kembalian dari server AWS'
+    };
+  }
+};
+
 export const warmupPredictServer = catchAsync(async (req, res, next) => {
   const mlTargetUrl = `${process.env.ML_API_URL}/predict`;
   
@@ -46,51 +102,60 @@ export const predictSyllable = catchAsync(async (req, res, next) => {
 
   const s3Result = await uploadAudioToS3(req.file.buffer, req.file.mimetype, userId);
 
-  const form = new FormData();
-  form.append('audio', req.file.buffer, {
-    filename: req.file.originalname || 'audio.wav',
-    contentType: req.file.mimetype,
-  });
-  form.append('target_label', target_label);
+  const [rendiResult, ghildanResult] = await Promise.all([
+    predictModelRendiWithRetry(req.file.buffer, req.file.originalname, req.file.mimetype, target_label, 5),
+    predictModelGhildan(req.file.buffer, target_label),
+  ]);
 
-  let mlResponse;
-  try {
-    const mlTargetUrl = `${process.env.ML_API_URL}/predict`;
-    
-    const response = await axios.post(mlTargetUrl, form, {
-      headers: { ...form.getHeaders() },
-      timeout: 60000,
-    });
-    
-    mlResponse = response.data;
-  } catch (error) {
+  if (rendiResult.status === 'error' && ghildanResult.status === 'error') {
     return next(
-      new AppError('Gagal mendapatkan hasil evaluasi dari server AI Machine Learning.', 502, {
-        code: 'ML_SERVER_ERROR',
-        errors: [{ rawMessage: error.response?.data || error.message }],
+      new AppError('Kedua server model AI Machine Learning gagal memproses audio Anda.', 502, {
+        code: 'ALL_ML_SERVERS_ERROR',
+        errors: [
+          { model_rendi: rendiResult.message },
+          { model_ghildan: ghildanResult.message }
+        ],
       })
     );
   }
 
-  const { actual_confidence, predicted_label, motivation_message, is_match } = mlResponse;
+  let finalAccuracy = 0;
+  let finalPredictionLabel = target_label;
+  let finalIsCorrect = false;
+  let finalAffirmation = 'Terus berlatih untuk hasil yang lebih maksimal!';
+  let chosenModel = 'none';
 
-  if (!predicted_label) {
-    return next(
-      new AppError('Server AI tidak mengembalikan hasil prediksi kata yang valid.', 502, {
-        code: 'ML_INVALID_RESPONSE',
-        errors: [{ rawResponse: mlResponse }],
-      })
-    );
+  let rendiScore = -1;
+  let ghildanScore = -1;
+
+  if (rendiResult.status === 'success') {
+    rendiScore = rendiResult.data.actual_confidence || 0;
+  }
+  if (ghildanResult.status === 'success') {
+    ghildanScore = ghildanResult.data.target_confidence || 0;
+  }
+
+  if (rendiScore >= ghildanScore && rendiResult.status === 'success') {
+    const rData = rendiResult.data;
+    finalAccuracy = rData.actual_confidence;
+    finalPredictionLabel = rData.predicted_label || target_label;
+    finalIsCorrect = rData.is_match;
+    finalAffirmation = rData.motivation_message || finalAffirmation;
+    chosenModel = 'rendy';
+  } else if (ghildanResult.status === 'success') {
+    const gData = ghildanResult.data;
+    finalAccuracy = gData.target_confidence;
+    finalPredictionLabel = gData.predicted_class || target_label;
+    finalIsCorrect = gData.match;
+    finalAffirmation = gData.motivational_text || finalAffirmation;
+    chosenModel = 'ghildan';
   }
 
   const predictedSyllableRecord = await prisma.syllable.findUnique({
-    where: { code: predicted_label.toLowerCase() },
+    where: { code: finalPredictionLabel.toLowerCase() },
   });
 
-  const isCorrect = is_match;
-
   const resultData = await prisma.$transaction(async (tx) => {
-    
     const audioFile = await tx.audioFile.create({
       data: {
         userId,
@@ -98,8 +163,8 @@ export const predictSyllable = catchAsync(async (req, res, next) => {
         s3Bucket: s3Result.s3Bucket,
         s3Region: process.env.AWS_REGION || 'ap-southeast-3',
         contentType: req.file.mimetype,
-        sizeBytes: req.file.size, 
-        durationMs: req.audio?.durationMs || 1000, 
+        sizeBytes: req.file.size,
+        durationMs: req.audio?.durationMs || 1000,
       },
     });
 
@@ -107,8 +172,8 @@ export const predictSyllable = catchAsync(async (req, res, next) => {
       data: {
         userId,
         targetSyllableId: targetSyllable.id,
-        isCorrect,
-        score: actual_confidence,
+        isCorrect: finalIsCorrect,
+        score: finalAccuracy,
         audioFileId: audioFile.id,
       },
     });
@@ -118,7 +183,7 @@ export const predictSyllable = catchAsync(async (req, res, next) => {
         practiceSessionId: practiceSession.id,
         audioFileId: audioFile.id,
         predictedSyllableId: predictedSyllableRecord ? predictedSyllableRecord.id : null,
-        affirmation: motivation_message || 'Terus berlatih untuk hasil yang lebih maksimal!',
+        affirmation: finalAffirmation,
       },
     });
 
@@ -137,10 +202,15 @@ export const predictSyllable = catchAsync(async (req, res, next) => {
       sessionId: resultData.sessionId,
       date: resultData.date,
       targetSyllable: targetSyllable.code,
-      predictedSyllable: predicted_label,
-      isCorrect,
-      accuracyScore: actual_confidence,
+      predictedSyllable: finalPredictionLabel,
+      isCorrect: finalIsCorrect,
+      accuracyScore: finalAccuracy,
       affirmation: resultData.affirmation,
+    },
+    metadata_comparison: {
+      chosen_model: chosenModel,
+      model_rendi: rendiResult,
+      model_ghildan: ghildanResult,
     },
   });
 });
